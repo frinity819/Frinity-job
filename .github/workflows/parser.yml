@@ -1,0 +1,32 @@
+name: Kleinanzeigen Parser
+
+on:
+  schedule:
+    # Запуск каждый день в 5:00 утра по Москве (02:00 UTC)
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Позволяет запускать вручную по кнопке
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # Максимальный лимит GitHub (6 часов)
+    
+    steps:
+    - name: Скачиваем код
+      uses: actions/checkout@v4
+
+    - name: Устанавливаем Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Устанавливаем зависимости
+      run: |
+        pip install -r requirements.txt
+        playwright install --with-deps chromium
+
+    - name: Запускаем парсер
+      env:
+        TG_TOKEN: ${{ secrets.TG_TOKEN }}
+        TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      run: python parser_job.py
