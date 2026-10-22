@@ -31,7 +31,7 @@ if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ============================================================
-# РАБОТА С GIST (Base64 для корректной работы с .db)
+# РАБОТА С GIST (Base64)
 # ============================================================
 def download_db_from_gist():
     if not GIST_ID or not GIST_TOKEN:
@@ -139,7 +139,6 @@ def sync_to_supabase():
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     try:
-        # 1. Объявления
         cursor.execute("SELECT link, title, first_seen FROM listings")
         listings = [dict(row) for row in cursor.fetchall()]
         if listings:
@@ -147,7 +146,6 @@ def sync_to_supabase():
                 supabase.table('listings').upsert(listings[i:i+500], on_conflict='link').execute()
             log.info(f"✅ Синхронизировано {len(listings)} объявлений.")
 
-        # 2. Снимки (только те, что новее последнего в облаке)
         res = supabase.table('snapshots').select('snapshot_at').order('snapshot_at', desc=True).limit(1).execute()
         last_cloud = res.data[0]['snapshot_at'] if res.data else "1970-01-01T00:00:00"
         
@@ -312,14 +310,30 @@ async def process_batch(links, db_conn):
 
 async def run_parser(search_url, max_pages, db_conn):
     log.info(f"Старт парсинга: {search_url} (стр: {max_pages})")
-    base_url = search_url
-    path, query = base_url.split("?", 1) if "?" in base_url else (base_url, "")
-    path = re.sub(r"/seite:\d+", "", path)
-    base_path, suffix = path.rsplit("/", 1) if "/" in path else (path, "k0")
     
+    # --- ИСПРАВЛЕННЫЙ БЛОК ФОРМИРОВАНИЯ URL ---
+    # Пример ссылки: https://www.kleinanzeigen.de/s-multimedia-elektronik/preis:120:950/c161
+    base_url = search_url.split("?")[0] # Отрезаем GET параметры
+    query = search_url.split("?")[1] if "?" in search_url else ""
+    
+    # Убираем старую пагинацию, если она была
+    base_url = re.sub(r"/seite:\d+", "", base_url)
+    
+    parts = base_url.strip("/").split("/")
+    if len(parts) > 2:
+        domain = "https://" + parts[0]
+        category = parts[1]      # например, s-multimedia-elektronik
+        id_part = parts[-1]      # например, c161
+        filters = parts[2:-1]    # например, preis:120:950
+        filters_str = "/".join(filters)
+    else:
+        domain = "https://www.kleinanzeigen.de"
+        category = "s-suchanfrage.html"
+        id_part = ""
+        filters_str = ""
+
     all_links = []
     async with async_playwright() as p:
-        # ДОБАВЛЕН USER-AGENT для обхода блокировок
         browser = await p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -329,41 +343,60 @@ async def run_parser(search_url, max_pages, db_conn):
         page = await context.new_page()
         
         for page_num in range(1, max_pages + 1):
+            # Собираем URL по точному шаблону Kleinanzeigen
             if page_num == 1:
-                url = f"{path}?{query}" if query else path
+                url = base_url
             else:
-                url = f"{base_path}/seite:{page_num}/{suffix}?{query}" if query else f"{base_path}/seite:{page_num}/{suffix}"
+                if filters_str:
+                    url = f"{domain}/{category}/{filters_str}/seite:{page_num}/{id_part}"
+                else:
+                    url = f"{domain}/{category}/seite:{page_num}/{id_part}"
+            
+            if query:
+                url += f"?{query}"
             
             log.info(f"Сканирую страницу {page_num}/{max_pages}: {url}")
             
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=20000)
-                await page.wait_for_timeout(4000) 
-                
-                content = await page.content()
-                if "Cloudflare" in content or "Access Denied" in content or "captcha" in content.lower():
-                    send_telegram_msg(f"🚫 Сайт заблокировал доступ (Cloudflare) на странице {page_num}.")
-                    break
+            # ДЕЛАЕМ 2 ПОПЫТКИ НА СЛУЧАЙ ОШИБКИ ИЛИ БЛОКИРОВКИ
+            page_links_found = 0
+            for attempt in range(2):
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                    # Прокрутка вниз для загрузки картинок и объявлений
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await page.wait_for_timeout(3500) 
+                    
+                    content = await page.content()
+                    if "Cloudflare" in content or "Access Denied" in content or "captcha" in content.lower():
+                        send_telegram_msg(f"🚫 Сайт заблокировал доступ (Cloudflare) на странице {page_num}.")
+                        return # Выходим совсем, если блокировка
 
-                links = page.locator("article.aditem a, a[href*='/s-anzeige/']")
-                cnt = await links.count()
-                log.info(f"  Найдено ссылок: {cnt}")
-                
-                if cnt == 0:
-                    log.info("  Объявлений не найдено. Возможно, закончились страницы или блокировка.")
-                    break
+                    links = page.locator("article.aditem a, a[href*='/s-anzeige/']")
+                    cnt = await links.count()
+                    
+                    if cnt > 0:
+                        log.info(f"  Найдено ссылок: {cnt}")
+                        page_links_found = cnt
+                        for i in range(cnt):
+                            href = await links.nth(i).get_attribute("href")
+                            if href and not href.startswith("http"):
+                                href = "https://www.kleinanzeigen.de" + href
+                            if href:
+                                clean = href.split("?")[0]
+                                if clean not in all_links:
+                                    all_links.append(clean)
+                        break # Если нашли ссылки, прекращаем попытки для этой страницы
+                    else:
+                        log.info(f"  Попытка {attempt+1}: 0 ссылок. Ждем 5 сек...")
+                        await page.wait_for_timeout(5000) # Ждем перед повтором
+                        
+                except Exception as e:
+                    log.error(f"Ошибка на странице {page_num} (попытка {attempt+1}): {e}")
+                    await page.wait_for_timeout(5000)
 
-                for i in range(cnt):
-                    href = await links.nth(i).get_attribute("href")
-                    if href and not href.startswith("http"):
-                        href = "https://www.kleinanzeigen.de" + href
-                    if href:
-                        clean = href.split("?")[0]
-                        if clean not in all_links:
-                            all_links.append(clean)
-            except Exception as e:
-                log.error(f"Ошибка на странице {page_num}: {e}")
-                continue
+            if page_links_found == 0:
+                log.info("  Страница пуста после 2 попыток. Похоже, объявления закончились.")
+                break # Останавливаем пагинацию, если страница реально пустая
                 
         await browser.close()
 
