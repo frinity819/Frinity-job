@@ -8,7 +8,9 @@ import urllib.parse
 import logging
 import requests
 import time
+import base64
 from playwright.async_api import async_playwright
+from supabase import create_client, Client # <-- ДОБАВЛЕНО ДЛЯ ОБЛАКА
 
 # ============================================================
 # НАСТРОЙКИ
@@ -17,13 +19,22 @@ TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 GIST_ID = os.environ.get("GIST_ID", "")
 GIST_TOKEN = os.environ.get("GIST_TOKEN", "")
+
+# --- НАСТРОЙКИ SUPABASE ---
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+supabase: Client = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+# ---------------------------
+
 DB_PATH = "listings.db"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
 # ============================================================
-# РАБОТА С GIST (Скачивание и Загрузка)
+# РАБОТА С GIST (Исправлено на Base64 для бинарных файлов)
 # ============================================================
 def download_db_from_gist():
     if not GIST_ID or not GIST_TOKEN:
@@ -38,12 +49,23 @@ def download_db_from_gist():
         
         gist_data = resp.json()
         file_data = gist_data["files"].get("listings.db")
-        if file_data and file_data.get("content"):
-            with open(DB_PATH, "w", encoding="utf-8") as f:
-                f.write(file_data["content"])
+        
+        if file_data:
+            content = file_data.get("content")
+            if not content:
+                # Если файл большой, GitHub отдает raw_url
+                raw_url = file_data.get("raw_url")
+                content_b64 = requests.get(raw_url).text
+            else:
+                content_b64 = content
+            
+            # Декодируем из Base64 в бинарный вид
+            db_bytes = base64.b64decode(content_b64)
+            with open(DB_PATH, "wb") as f:
+                f.write(db_bytes)
             log.info("База успешно скачана из Gist.")
         else:
-            log.warning("В Gist нет файла listings.db или он пуст. Создаем новую базу.")
+            log.warning("В Gist нет файла listings.db. Создаем новую базу.")
     except Exception as e:
         log.error(f"Ошибка скачивания из Gist: {e}")
 
@@ -53,12 +75,12 @@ def upload_db_to_gist():
         return
     log.info("Загружаем базу в Gist...")
     try:
-        with open(DB_PATH, "r", encoding="utf-8") as f:
-            content = f.read()
+        with open(DB_PATH, "rb") as f:
+            content_b64 = base64.b64encode(f.read()).decode('utf-8')
         
         url = f"https://api.github.com/gists/{GIST_ID}"
         headers = {"Authorization": f"token {GIST_TOKEN}", "Accept": "application/vnd.github+json"}
-        data = {"files": {"listings.db": {"content": content}}}
+        data = {"files": {"listings.db": {"content": content_b64, "encoding": "base64"}}}
         
         resp = requests.patch(url, headers=headers, json=data, timeout=30)
         resp.raise_for_status()
@@ -110,6 +132,44 @@ def record_listing(conn, item):
         conn.commit()
         return True
     return False
+
+# ============================================================
+# СИНХРОНИЗАЦИЯ С SUPABASE (ДОБАВЛЕНО)
+# ============================================================
+def sync_to_supabase():
+    if not supabase:
+        log.warning("Supabase не настроен. Пропускаем.")
+        return
+    log.info("Начинаем синхронизацию с Supabase...")
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    try:
+        # 1. Отправляем объявления (они не дублируются благодаря upsert)
+        cursor.execute("SELECT link, title, first_seen FROM listings")
+        listings = [dict(row) for row in cursor.fetchall()]
+        if listings:
+            for i in range(0, len(listings), 500):
+                supabase.table('listings').upsert(listings[i:i+500], on_conflict='link').execute()
+            log.info(f"✅ Синхронизировано {len(listings)} объявлений.")
+
+        # 2. Отправляем снимки (только новые)
+        res = supabase.table('snapshots').select('snapshot_at').order('snapshot_at', desc=True).limit(1).execute()
+        last_cloud = res.data[0]['snapshot_at'] if res.data else "1970-01-01T00:00:00"
+        
+        cursor.execute("SELECT link, price, price_numeric, views, favorites, posted_date, snapshot_at FROM snapshots WHERE snapshot_at > ?", (last_cloud,))
+        snapshots = [dict(row) for row in cursor.fetchall()]
+        
+        if snapshots:
+            for i in range(0, len(snapshots), 500):
+                supabase.table('snapshots').insert(snapshots[i:i+500]).execute()
+            log.info(f"✅ Синхронизировано {len(snapshots)} новых снимков.")
+        else:
+            log.info("Новых снимков для Supabase нет.")
+    except Exception as e:
+        log.error(f"❌ Ошибка Supabase: {e}")
+    finally:
+        conn.close()
 
 # ============================================================
 # TELEGRAM API
@@ -183,9 +243,10 @@ def wait_for_user_url():
     return None, None
 
 # ============================================================
-# ПАРСЕР (Playwright)
+# ПАРСЕР (Playwright) - ВАШ ОРИГИНАЛЬНЫЙ КОД
 # ============================================================
 async def get_listing_details(page, url, retries=2):
+    # ... (оставил без изменений) ...
     for attempt in range(retries):
         try:
             if page.is_closed(): return None
@@ -233,6 +294,7 @@ async def get_listing_details(page, url, retries=2):
             await asyncio.sleep(2)
 
 async def process_batch(links, db_conn):
+    # ... (оставил без изменений) ...
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
         context = await browser.new_context(viewport={"width": 1366, "height": 768}, locale="de-DE")
@@ -257,6 +319,7 @@ async def process_batch(links, db_conn):
                     send_telegram_msg(msg)
 
 async def run_parser(search_url, max_pages, db_conn):
+    # ... (оставил без изменений) ...
     log.info(f"Старт парсинга: {search_url} (стр: {max_pages})")
     base_url = search_url
     path, query = base_url.split("?", 1) if "?" in base_url else (base_url, "")
@@ -325,7 +388,11 @@ async def main():
     # 4. Загружаем базу обратно в Gist и отправляем в ТГ
     upload_db_to_gist()
     send_telegram_db()
-    send_telegram_msg("✅ Парсинг завершен. База данных обновлена и отправлена выше. Сервер выключается.")
+    
+    # 5. СИНХРОНИЗАЦИЯ С SUPABASE (НОВЫЙ ШАГ)
+    sync_to_supabase()
+    
+    send_telegram_msg("✅ Парсинг завершен. База данных обновлена, отправлена в Telegram и синхронизирована с Supabase. Сервер выключается.")
 
 if __name__ == "__main__":
     asyncio.run(main())
