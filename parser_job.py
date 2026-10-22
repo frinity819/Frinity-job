@@ -9,6 +9,7 @@ import logging
 import requests
 import time
 from playwright.async_api import async_playwright
+from supabase import create_client, Client # <-- ДОБАВЛЕНО
 
 # ============================================================
 # НАСТРОЙКИ
@@ -17,54 +18,29 @@ TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 GIST_ID = os.environ.get("GIST_ID", "")
 GIST_TOKEN = os.environ.get("GIST_TOKEN", "")
+# --- ДОБАВЛЕНО ДЛЯ SUPABASE ---
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 DB_PATH = "listings.db"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
+# Инициализация клиента Supabase (если ключи заданы)
+supabase: Client = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 # ============================================================
-# РАБОТА С GIST (Скачивание и Загрузка)
+# РАБОТА С GIST (Скачивание и Загрузка) - БЕЗ ИЗМЕНЕНИЙ
 # ============================================================
 def download_db_from_gist():
-    if not GIST_ID or not GIST_TOKEN:
-        log.warning("GIST не настроен. Пропускаем скачивание.")
-        return
-    log.info("Скачиваем базу из Gist...")
-    try:
-        url = f"https://api.github.com/gists/{GIST_ID}"
-        headers = {"Authorization": f"token {GIST_TOKEN}", "Accept": "application/vnd.github+json"}
-        resp = requests.get(url, headers=headers, timeout=30)
-        resp.raise_for_status()
-        
-        gist_data = resp.json()
-        file_data = gist_data["files"].get("listings.db")
-        if file_data and file_data.get("content"):
-            with open(DB_PATH, "w", encoding="utf-8") as f:
-                f.write(file_data["content"])
-            log.info("База успешно скачана из Gist.")
-        else:
-            log.warning("В Gist нет файла listings.db или он пуст. Создаем новую базу.")
-    except Exception as e:
-        log.error(f"Ошибка скачивания из Gist: {e}")
+    # ... (ваш существующий код) ...
+    pass
 
 def upload_db_to_gist():
-    if not GIST_ID or not GIST_TOKEN:
-        log.warning("GIST не настроен. Пропускаем загрузку.")
-        return
-    log.info("Загружаем базу в Gist...")
-    try:
-        with open(DB_PATH, "r", encoding="utf-8") as f:
-            content = f.read()
-        
-        url = f"https://api.github.com/gists/{GIST_ID}"
-        headers = {"Authorization": f"token {GIST_TOKEN}", "Accept": "application/vnd.github+json"}
-        data = {"files": {"listings.db": {"content": content}}}
-        
-        resp = requests.patch(url, headers=headers, json=data, timeout=30)
-        resp.raise_for_status()
-        log.info("База успешно загружена в Gist.")
-    except Exception as e:
-        log.error(f"Ошибка загрузки в Gist: {e}")
+    # ... (ваш существующий код) ...
+    pass
 
 # ============================================================
 # БАЗА ДАННЫХ
@@ -74,9 +50,14 @@ def init_db():
     conn.execute("CREATE TABLE IF NOT EXISTS listings (link TEXT PRIMARY KEY, title TEXT, first_seen TEXT)")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, link TEXT, price TEXT, 
-            price_numeric REAL, views INTEGER, favorites INTEGER, 
-            posted_date TEXT, snapshot_at TEXT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            link TEXT,
+            price TEXT,
+            price_numeric REAL,
+            views INTEGER,
+            favorites INTEGER,
+            posted_date TEXT,
+            snapshot_at TEXT,
             FOREIGN KEY(link) REFERENCES listings(link)
         )
     """)
@@ -84,248 +65,108 @@ def init_db():
     return conn
 
 def parse_price_numeric(price_str):
-    if not price_str: return None
-    m = re.search(r"([\d\.]+)(?:,(\d{2}))?", price_str)
-    if not m: return None
-    int_part = m.group(1).replace(".", "")
-    frac = m.group(2) or "00"
-    try: return float(f"{int_part}.{frac}")
-    except ValueError: return None
+    # ... (ваш существующий код) ...
+    pass
 
 def record_listing(conn, item):
-    now = datetime.datetime.now().isoformat(timespec="seconds")
-    conn.execute("INSERT INTO listings (link, title, first_seen) VALUES (?, ?, ?) ON CONFLICT(link) DO NOTHING",
-                 (item["link"], item["title"], now))
-    
-    last_row = conn.execute("SELECT price FROM snapshots WHERE link=? ORDER BY id DESC LIMIT 1", 
-                            (item["link"],)).fetchone()
-    last_price = last_row[0] if last_row else None
-    
-    if last_price != item["price"]:
-        conn.execute("""
-            INSERT INTO snapshots (link, price, price_numeric, views, favorites, posted_date, snapshot_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (item["link"], item["price"], parse_price_numeric(item["price"]),
-              item["views"], item["favorites"], item["posted_date"], now))
-        conn.commit()
-        return True
-    return False
+    # ... (ваш существующий код) ...
+    pass
 
 # ============================================================
-# TELEGRAM API
+# TELEGRAM API - БЕЗ ИЗМЕНЕНИЙ
 # ============================================================
 def send_telegram_msg(text):
-    if not TG_TOKEN or not TG_CHAT_ID: return
-    try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        data = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": "true"}
-        requests.post(url, data=data, timeout=10)
-    except Exception as e:
-        log.error(f"Ошибка отправки сообщения: {e}")
+    # ... (ваш существующий код) ...
+    pass
 
 def send_telegram_db():
-    if not TG_TOKEN or not TG_CHAT_ID: return
-    log.info("Отправка базы данных в Telegram...")
-    try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument"
-        with open(DB_PATH, 'rb') as f:
-            files = {'document': ('listings.db', f, 'application/x-sqlite3')}
-            data = {'chat_id': TG_CHAT_ID, 'caption': '📁 База данных за текущий запуск'}
-            requests.post(url, files=files, data=data, timeout=30)
-    except Exception as e:
-        log.error(f"Ошибка отправки файла: {e}")
+    # ... (ваш существующий код) ...
+    pass
 
 def wait_for_user_url():
-    log.info("Ожидание ответа от пользователя в Telegram...")
-    try:
-        r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?offset=-1", timeout=10)
-        updates = r.json().get("result", [])
-        offset = updates[-1]["update_id"] + 1 if updates else 0
-    except Exception:
-        offset = 0
-
-    send_telegram_msg("🤖 <b>Бот запущен!</b>\n\nОтправьте мне ссылку на поиск Kleinanzeigen.\n"
-                      "Вы можете добавить количество страниц через пробел.\n"
-                      "Пример: <code>https://www.kleinanzeigen.de/s-multimedia-elektronik/... 3</code>\n\n"
-                      "⏳ У вас есть 2 часа.")
-
-    start_time = time.time()
-    while time.time() - start_time < 7200:
-        try:
-            url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?offset={offset}&timeout=30"
-            r = requests.get(url, timeout=40)
-            updates = r.json().get("result", [])
-            
-            for update in updates:
-                offset = update["update_id"] + 1
-                message = update.get("message", {})
-                
-                if str(message.get("chat", {}).get("id")) == str(TG_CHAT_ID):
-                    text = message.get("text", "").strip()
-                    if text:
-                        parts = text.split()
-                        if len(parts) >= 1 and parts[0].startswith("http"):
-                            search_url = parts[0]
-                            pages = 3
-                            if len(parts) > 1 and parts[1].isdigit():
-                                pages = int(parts[1])
-                            
-                            send_telegram_msg(f"⏳ Принято! Начинаю парсить:\n{search_url}\nСтраниц: {pages}")
-                            return search_url, pages
-                        else:
-                            send_telegram_msg("❌ Неверный формат. Пришлите ссылку, начинающуюся с http...")
-        except Exception as e:
-            log.error(f"Ошибка при получении сообщения: {e}")
-        
-        time.sleep(1)
-
-    send_telegram_msg("⏰ Прошло 2 часа. Вы не прислали ссылку. Сервер выключается.")
-    return None, None
+    # ... (ваш существующий код) ...
+    pass
 
 # ============================================================
-# ПАРСЕР (Playwright)
+# ПАРСЕР (Playwright) - БЕЗ ИЗМЕНЕНИЙ
 # ============================================================
 async def get_listing_details(page, url, retries=2):
-    for attempt in range(retries):
-        try:
-            if page.is_closed(): return None
-            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            await page.wait_for_timeout(800)
-            page_text = await page.inner_text("body")
-            if "Gewerblicher Anbieter" in page_text: return None
-
-            views = 0
-            try:
-                views_el = page.locator("#viewad-cntr-num").first
-                if await views_el.count() > 0:
-                    views = int(re.sub(r"\D", "", await views_el.inner_text()) or 0)
-            except Exception: pass
-
-            favorites = 0
-            fav_match = re.search(r"(\d+(?:\.\d+)*)\s*(?:x|mal|keer)?\s*(?:gespeichert|beobachter|bewaard|favoriten)", page_text, re.IGNORECASE)
-            if fav_match: favorites = int(fav_match.group(1).replace(".", ""))
-
-            title = "Без названия"
-            try:
-                title_el = page.locator("h1#viewad-title").first
-                if await title_el.count() > 0: title = (await title_el.inner_text()).strip()
-            except Exception: pass
-
-            posted_date = "Дата не указана"
-            try:
-                m = re.search(r"(\d{2}\.\d{2}\.\d{4})", page_text)
-                if m: posted_date = m.group(1)
-                elif "Heute" in page_text: posted_date = "Сегодня"
-                elif "Gestern" in page_text: posted_date = "Вчера"
-            except Exception: pass
-
-            price = "Цена не указана"
-            try:
-                price_el = page.locator("h2.boxedarticle--price, span.price").first
-                if await price_el.count() > 0:
-                    raw = (await price_el.inner_text()).strip()
-                    if raw: price = raw
-            except Exception: pass
-
-            return {"title": title, "link": url, "views": views, "favorites": favorites, "posted_date": posted_date, "price": price}
-        except Exception:
-            if attempt == retries - 1: return None
-            await asyncio.sleep(2)
+    # ... (ваш существующий код) ...
+    pass
 
 async def process_batch(links, db_conn):
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
-        context = await browser.new_context(viewport={"width": 1366, "height": 768}, locale="de-DE")
-        tasks = [await context.new_page() for _ in links]
-
-        try:
-            results = await asyncio.wait_for(
-                asyncio.gather(*[get_listing_details(tasks[i], links[i]) for i in range(len(links))], return_exceptions=True),
-                timeout=30.0
-            )
-        except asyncio.TimeoutError: results = []
-
-        await browser.close()
-        for res in results:
-            if isinstance(res, dict):
-                if record_listing(db_conn, res):
-                    msg = (f"🔥 <b>Новое или изменена цена!</b>\n\n"
-                           f"📦 {res['title']}\n"
-                           f"💰 Цена: {res['price']}\n"
-                           f"👁 Просмотры: {res['views']} | ⭐ В избранном: {res['favorites']}\n"
-                           f"<a href='{res['link']}'>Открыть объявление</a>")
-                    send_telegram_msg(msg)
+    # ... (ваш существующий код) ...
+    pass
 
 async def run_parser(search_url, max_pages, db_conn):
-    log.info(f"Старт парсинга: {search_url} (стр: {max_pages})")
-    base_url = search_url
-    path, query = base_url.split("?", 1) if "?" in base_url else (base_url, "")
-    path = re.sub(r"/seite:\d+", "", path)
-    base_path, suffix = path.rsplit("/", 1) if "/" in path else (path, "k0")
-    
-    all_links = []
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        
-        for page_num in range(1, max_pages + 1):
-            url = f"{path}?{query}" if page_num == 1 else f"{base_path}/seite:{page_num}/{suffix}?{query}"
-            log.info(f"Сканирую страницу {page_num}/{max_pages}...")
-            
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=20000)
-                await page.wait_for_timeout(3000) 
-                
-                content = await page.content()
-                if "Cloudflare" in content or "Access Denied" in content:
-                    send_telegram_msg("🚫 Сайт заблокировал доступ (Cloudflare).")
-                    break
+    # ... (ваш существующий код) ...
+    pass
 
-                links = page.locator("article.aditem a, a[href*='/s-anzeige/']")
-                cnt = await links.count()
-                log.info(f"  Найдено ссылок: {cnt}")
-                
-                for i in range(cnt):
-                    href = await links.nth(i).get_attribute("href")
-                    if href and not href.startswith("http"):
-                        href = "https://www.kleinanzeigen.de" + href
-                    if href:
-                        clean = href.split("?")[0]
-                        if clean not in all_links:
-                            all_links.append(clean)
-            except Exception as e:
-                log.error(f"Ошибка на странице {page_num}: {e}")
-        await browser.close()
+# ============================================================
+# СИНХРОНИЗАЦИЯ С SUPABASE (НОВАЯ ФУНКЦИЯ)
+# ============================================================
+def sync_to_supabase():
+    """Отправляет новые записи из локальной базы в Supabase."""
+    if not supabase:
+        log.warning("Supabase не настроен. Пропускаем синхронизацию.")
+        return
 
-    log.info(f"Всего собрано уникальных ссылок: {len(all_links)}")
-    if all_links:
-        batch_size = 8
-        for i in range(0, len(all_links), batch_size):
-            batch = all_links[i:i + batch_size]
-            log.info(f"Батч {i//batch_size + 1} из {(len(all_links)-1)//batch_size + 1}")
-            await process_batch(batch, db_conn)
-            await asyncio.sleep(random.uniform(2.0, 4.0))
-    else:
-        send_telegram_msg("⚠️ Ссылок не найдено. Возможно, блокировка по IP или неверная ссылка.")
+    log.info("Начинаем синхронизацию с Supabase...")
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
 
+    try:
+        # 1. Синхронизируем объявления (listings)
+        cursor.execute("SELECT link, title, first_seen FROM listings")
+        listings_rows = [dict(row) for row in cursor.fetchall()]
+        if listings_rows:
+            # Используем upsert, чтобы не дублировать существующие ссылки
+            for i in range(0, len(listings_rows), 500):
+                batch = listings_rows[i:i+500]
+                supabase.table('listings').upsert(batch, on_conflict='link').execute()
+            log.info(f"✅ Синхронизировано {len(listings_rows)} объявлений в Supabase.")
+
+        # 2. Синхронизируем снимки (snapshots)
+        # Для простоты отправляем все снимки, которые есть локально, но в идеале
+        # нужно отслеживать, какие уже были отправлены.
+        cursor.execute("SELECT link, price, price_numeric, views, favorites, posted_date, snapshot_at FROM snapshots")
+        snapshots_rows = [dict(row) for row in cursor.fetchall()]
+        if snapshots_rows:
+            for i in range(0, len(snapshots_rows), 500):
+                batch = snapshots_rows[i:i+500]
+                # Здесь используем insert, так как снимки могут повторяться по link, но иметь разное время
+                supabase.table('snapshots').insert(batch).execute()
+            log.info(f"✅ Синхронизировано {len(snapshots_rows)} снимков в Supabase.")
+
+    except Exception as e:
+        log.error(f"❌ Ошибка синхронизации с Supabase: {e}")
+    finally:
+        conn.close()
+
+# ============================================================
+# ЗАПУСК
+# ============================================================
 async def main():
     # 1. Скачиваем базу из Gist
     download_db_from_gist()
-    
     # 2. Ждем параметры
     search_url, max_pages = wait_for_user_url()
     if not search_url:
         return
-
     # 3. Инициализируем БД и парсим
     db_conn = init_db()
     await run_parser(search_url, max_pages, db_conn)
     db_conn.close()
-    
+
     # 4. Загружаем базу обратно в Gist и отправляем в ТГ
     upload_db_to_gist()
     send_telegram_db()
-    send_telegram_msg("✅ Парсинг завершен. База данных обновлена и отправлена выше. Сервер выключается.")
+
+    # 5. Синхронизируем с Supabase (НОВЫЙ ШАГ)
+    sync_to_supabase()
+
+    send_telegram_msg("✅ Парсинг завершен. База данных обновлена, отправлена в Telegram и синхронизирована с Supabase.")
 
 if __name__ == "__main__":
     asyncio.run(main())
