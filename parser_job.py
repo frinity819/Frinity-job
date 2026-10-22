@@ -394,6 +394,27 @@ async def run_parser(search_url, max_pages, db_conn):
         await browser.close()
 
     log.info(f"Всего собрано уникальных ссылок: {len(all_links)}")
+    
+    # ============================================================
+    # ФИЛЬТРАЦИЯ ДУБЛИКАТОВ (Проверка за последние 5 часов)
+    # ============================================================
+    if all_links:
+        cursor = db_conn.cursor()
+        # Вычисляем время 5 часов назад
+        time_threshold = (datetime.datetime.now() - datetime.timedelta(hours=5)).isoformat(timespec="seconds")
+        
+        cursor.execute("SELECT DISTINCT link FROM snapshots WHERE snapshot_at > ?", (time_threshold,))
+        recently_checked = {row[0] for row in cursor.fetchall()}
+        
+        filtered_links = [link for link in all_links if link not in recently_checked]
+        
+        skipped_count = len(all_links) - len(filtered_links)
+        log.info(f"🔍 Фильтрация: пропущено {skipped_count} недавно проверенных ссылок (менее 5 часов назад).")
+        log.info(f"🎯 Осталось ссылок для парсинга: {len(filtered_links)}")
+        
+        all_links = filtered_links
+    # ============================================================
+
     if all_links:
         batch_size = 8
         for i in range(0, len(all_links), batch_size):
@@ -402,7 +423,8 @@ async def run_parser(search_url, max_pages, db_conn):
             await process_batch(batch, db_conn)
             await asyncio.sleep(random.uniform(2.0, 4.0))
     else:
-        send_telegram_msg("⚠️ Ссылок не найдено. Возможно, блокировка по IP или неверная ссылка.")
+        log.info("Нет новых или требующих обновления объявлений.")
+        send_telegram_msg("ℹ️ Парсинг завершен: новых объявлений нет, а старые были проверены недавно.")
 
 async def main():
     download_db_from_gist()
