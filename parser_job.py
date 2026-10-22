@@ -23,6 +23,11 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 DB_PATH = "listings.db"
 
+# --- НАСТРОЙКИ ПО УМОЛЧАНИЮ (если не прислали ссылку) ---
+DEFAULT_SEARCH_URL = "https://www.kleinanzeigen.de/s-multimedia-elektronik/preis:120:950/c161"
+DEFAULT_PAGES = 50
+WAIT_TIMEOUT_MINUTES = 20 # Ждем 20 минут перед тем, как включить дефолтную ссылку
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
@@ -189,7 +194,7 @@ def send_telegram_db():
         log.error(f"Ошибка отправки файла: {e}")
 
 def wait_for_user_url():
-    log.info("Ожидание ответа от пользователя в Telegram...")
+    log.info(f"Ожидание ответа от пользователя в Telegram (макс. {WAIT_TIMEOUT_MINUTES} мин)...")
     try:
         r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?offset=-1", timeout=10)
         updates = r.json().get("result", [])
@@ -197,13 +202,13 @@ def wait_for_user_url():
     except Exception:
         offset = 0
 
-    send_telegram_msg("🤖 <b>Бот запущен!</b>\n\nОтправьте мне ссылку на поиск Kleinanzeigen.\n"
-                      "Вы можете добавить количество страниц через пробел.\n"
-                      "Пример: <code>https://www.kleinanzeigen.de/s-multimedia-elektronik/... 3</code>\n\n"
-                      "⏳ У вас есть 2 часа.")
+    send_telegram_msg(f"🤖 <b>Бот запущен!</b>\n\nОтправьте мне ссылку на поиск Kleinanzeigen.\n"
+                      f"Вы можете добавить количество страниц через пробел.\n"
+                      f"Пример: <code>https://www.kleinanzeigen.de/s-... 3</code>\n\n"
+                      f"⏳ У вас есть {WAIT_TIMEOUT_MINUTES} минут. Если не ответите, бот запустит парсинг по умолчанию.")
 
     start_time = time.time()
-    while time.time() - start_time < 7200:
+    while time.time() - start_time < (WAIT_TIMEOUT_MINUTES * 60):
         try:
             url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?offset={offset}&timeout=30"
             r = requests.get(url, timeout=40)
@@ -232,8 +237,10 @@ def wait_for_user_url():
         
         time.sleep(1)
 
-    send_telegram_msg("⏰ Прошло 2 часа. Вы не прислали ссылку. Сервер выключается.")
-    return None, None
+    # Если время вышло и ссылку не прислали — запускаем дефолт
+    log.info("Время ожидания вышло. Запускаем парсинг по умолчанию.")
+    send_telegram_msg(f"⏰ Время вышло. Запускаю парсинг по умолчанию:\n{DEFAULT_SEARCH_URL}\nСтраниц: {DEFAULT_PAGES}")
+    return DEFAULT_SEARCH_URL, DEFAULT_PAGES
 
 # ============================================================
 # ПАРСЕР (Playwright)
@@ -312,11 +319,8 @@ async def process_batch(links, db_conn):
 async def run_parser(search_url, max_pages, db_conn):
     log.info(f"Старт парсинга: {search_url} (стр: {max_pages})")
     
-    # --- НАДЕЖНОЕ ФОРМИРОВАНИЕ URL С ПОМОЩЬЮ urllib ---
     parsed_url = urlparse(search_url)
-    domain = f"{parsed_url.scheme}://{parsed_url.netloc}" # https://www.kleinanzeigen.de
-    
-    # Разбираем путь: /s-multimedia-elektronik/preis:120:950/c161
+    domain = f"{parsed_url.scheme}://{parsed_url.netloc}" 
     path_parts = [p for p in parsed_url.path.split("/") if p]
     
     all_links = []
@@ -333,7 +337,6 @@ async def run_parser(search_url, max_pages, db_conn):
             if page_num == 1:
                 url = search_url
             else:
-                # Собираем URL вида: domain/category/filters/seite:N/id
                 if len(path_parts) >= 3:
                     category = path_parts[0]
                     item_id = path_parts[-1]
@@ -342,7 +345,6 @@ async def run_parser(search_url, max_pages, db_conn):
                     parts_to_join = [domain, category] + filters + [f"seite:{page_num}", item_id]
                     url = "/".join(parts_to_join)
                 else:
-                    # Запасной вариант
                     url = f"{domain}/{path_parts[0]}/seite:{page_num}"
                     
                 if parsed_url.query:
@@ -350,7 +352,6 @@ async def run_parser(search_url, max_pages, db_conn):
             
             log.info(f"Сканирую страницу {page_num}/{max_pages}: {url}")
             
-            # ДЕЛАЕМ 2 ПОПЫТКИ НА СЛУЧАЙ ОШИБКИ
             page_links_found = 0
             for attempt in range(2):
                 try:
@@ -405,10 +406,9 @@ async def run_parser(search_url, max_pages, db_conn):
 
 async def main():
     download_db_from_gist()
+    
     search_url, max_pages = wait_for_user_url()
-    if not search_url:
-        return
-
+    
     db_conn = init_db()
     await run_parser(search_url, max_pages, db_conn)
     db_conn.close()
