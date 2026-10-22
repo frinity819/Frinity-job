@@ -1,7 +1,9 @@
 name: Cloud Parser
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: # Ручной запуск
+  schedule:
+    - cron: '0 */4 * * *' # Автоматический запуск каждые 4 часа (6 раз в день)
 
 jobs:
   run-parser:
