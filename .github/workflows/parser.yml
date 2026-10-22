@@ -1,9 +1,9 @@
 name: Cloud Parser
 
 on:
-  workflow_dispatch: # Ручной запуск
+  workflow_dispatch:
   schedule:
-    - cron: '0 */4 * * *' # Автоматический запуск каждые 4 часа (6 раз в день)
+    - cron: '0 */4 * * *'
 
 jobs:
   run-parser:
@@ -18,12 +18,32 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip' # Включает встроенный кэш для pip
+
+      # Кэшируем браузеры Playwright
+      - name: Cache Playwright Browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          playwright install --with-deps chromium
+          
+      # Устанавливаем браузер только если его нет в кэше
+      - name: Install Playwright Browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: playwright install --with-deps chromium
+
+      # Если браузер взялся из кэша, все равно нужно доустановить системные зависимости (они быстрые)
+      - name: Install Playwright Deps (if cached)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: playwright install-deps chromium
 
       - name: Run parser
         env:
