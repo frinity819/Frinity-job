@@ -11,14 +11,60 @@ import time
 from playwright.async_api import async_playwright
 
 # ============================================================
-# НАСТРОЙКИ (подтягиваются из GitHub Secrets)
+# НАСТРОЙКИ
 # ============================================================
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+GIST_ID = os.environ.get("GIST_ID", "")
+GIST_TOKEN = os.environ.get("GIST_TOKEN", "")
 DB_PATH = "listings.db"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
+
+# ============================================================
+# РАБОТА С GIST (Скачивание и Загрузка)
+# ============================================================
+def download_db_from_gist():
+    if not GIST_ID or not GIST_TOKEN:
+        log.warning("GIST не настроен. Пропускаем скачивание.")
+        return
+    log.info("Скачиваем базу из Gist...")
+    try:
+        url = f"https://api.github.com/gists/{GIST_ID}"
+        headers = {"Authorization": f"token {GIST_TOKEN}", "Accept": "application/vnd.github+json"}
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        
+        gist_data = resp.json()
+        file_data = gist_data["files"].get("listings.db")
+        if file_data and file_data.get("content"):
+            with open(DB_PATH, "w", encoding="utf-8") as f:
+                f.write(file_data["content"])
+            log.info("База успешно скачана из Gist.")
+        else:
+            log.warning("В Gist нет файла listings.db или он пуст. Создаем новую базу.")
+    except Exception as e:
+        log.error(f"Ошибка скачивания из Gist: {e}")
+
+def upload_db_to_gist():
+    if not GIST_ID or not GIST_TOKEN:
+        log.warning("GIST не настроен. Пропускаем загрузку.")
+        return
+    log.info("Загружаем базу в Gist...")
+    try:
+        with open(DB_PATH, "r", encoding="utf-8") as f:
+            content = f.read()
+        
+        url = f"https://api.github.com/gists/{GIST_ID}"
+        headers = {"Authorization": f"token {GIST_TOKEN}", "Accept": "application/vnd.github+json"}
+        data = {"files": {"listings.db": {"content": content}}}
+        
+        resp = requests.patch(url, headers=headers, json=data, timeout=30)
+        resp.raise_for_status()
+        log.info("База успешно загружена в Gist.")
+    except Exception as e:
+        log.error(f"Ошибка загрузки в Gist: {e}")
 
 # ============================================================
 # БАЗА ДАННЫХ
@@ -66,7 +112,7 @@ def record_listing(conn, item):
     return False
 
 # ============================================================
-# TELEGRAM API (ОТПРАВКА И ОЖИДАНИЕ)
+# TELEGRAM API
 # ============================================================
 def send_telegram_msg(text):
     if not TG_TOKEN or not TG_CHAT_ID: return
@@ -90,10 +136,7 @@ def send_telegram_db():
         log.error(f"Ошибка отправки файла: {e}")
 
 def wait_for_user_url():
-    """Ожидает сообщение от пользователя с URL и количеством страниц (2 часа)."""
     log.info("Ожидание ответа от пользователя в Telegram...")
-    
-    # Сбрасываем старые сообщения, чтобы не схватить вчерашнее
     try:
         r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?offset=-1", timeout=10)
         updates = r.json().get("result", [])
@@ -107,10 +150,8 @@ def wait_for_user_url():
                       "⏳ У вас есть 2 часа.")
 
     start_time = time.time()
-    # Ждем 2 часа (7200 секунд)
     while time.time() - start_time < 7200:
         try:
-            # timeout=30 означает "длинный опрос" для экономии ресурсов
             url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?offset={offset}&timeout=30"
             r = requests.get(url, timeout=40)
             updates = r.json().get("result", [])
@@ -161,7 +202,7 @@ async def get_listing_details(page, url, retries=2):
             except Exception: pass
 
             favorites = 0
-            fav_match = re.search(r"(\d+(?:\.\d+)*)\s*(?:x|keer|mal)\s*(?:beobachter|gespeichert|bewaard)", page_text, re.IGNORECASE)
+            fav_match = re.search(r"(\d+(?:\.\d+)*)\s*(?:x|mal|keer)?\s*(?:gespeichert|beobachter|bewaard|favoriten)", page_text, re.IGNORECASE)
             if fav_match: favorites = int(fav_match.group(1).replace(".", ""))
 
             title = "Без названия"
@@ -211,13 +252,12 @@ async def process_batch(links, db_conn):
                     msg = (f"🔥 <b>Новое или изменена цена!</b>\n\n"
                            f"📦 {res['title']}\n"
                            f"💰 Цена: {res['price']}\n"
-                           f"👁 Просмотры: {res['views']}\n"
+                           f"👁 Просмотры: {res['views']} | ⭐ В избранном: {res['favorites']}\n"
                            f"<a href='{res['link']}'>Открыть объявление</a>")
                     send_telegram_msg(msg)
 
 async def run_parser(search_url, max_pages, db_conn):
     log.info(f"Старт парсинга: {search_url} (стр: {max_pages})")
-    
     base_url = search_url
     path, query = base_url.split("?", 1) if "?" in base_url else (base_url, "")
     path = re.sub(r"/seite:\d+", "", path)
@@ -258,7 +298,6 @@ async def run_parser(search_url, max_pages, db_conn):
         await browser.close()
 
     log.info(f"Всего собрано уникальных ссылок: {len(all_links)}")
-    
     if all_links:
         batch_size = 8
         for i in range(0, len(all_links), batch_size):
@@ -270,17 +309,23 @@ async def run_parser(search_url, max_pages, db_conn):
         send_telegram_msg("⚠️ Ссылок не найдено. Возможно, блокировка по IP или неверная ссылка.")
 
 async def main():
+    # 1. Скачиваем базу из Gist
+    download_db_from_gist()
+    
+    # 2. Ждем параметры
     search_url, max_pages = wait_for_user_url()
     if not search_url:
         return
 
+    # 3. Инициализируем БД и парсим
     db_conn = init_db()
     await run_parser(search_url, max_pages, db_conn)
     db_conn.close()
     
+    # 4. Загружаем базу обратно в Gist и отправляем в ТГ
+    upload_db_to_gist()
     send_telegram_db()
-    send_telegram_msg("✅ Парсинг завершен. База данных отправлена выше. Сервер выключается.")
-    log.info("Работа завершена.")
+    send_telegram_msg("✅ Парсинг завершен. База данных обновлена и отправлена выше. Сервер выключается.")
 
 if __name__ == "__main__":
     asyncio.run(main())
