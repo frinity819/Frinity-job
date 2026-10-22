@@ -49,8 +49,6 @@ jobs:
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          GIST_ID: ${{ secrets.GIST_ID }}
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python parser_job.py
