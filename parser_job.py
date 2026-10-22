@@ -8,6 +8,7 @@ import logging
 import requests
 import time
 import base64
+from urllib.parse import urlparse
 from playwright.async_api import async_playwright
 from supabase import create_client, Client
 
@@ -311,27 +312,13 @@ async def process_batch(links, db_conn):
 async def run_parser(search_url, max_pages, db_conn):
     log.info(f"Старт парсинга: {search_url} (стр: {max_pages})")
     
-    # --- ИСПРАВЛЕННЫЙ БЛОК ФОРМИРОВАНИЯ URL ---
-    # Пример ссылки: https://www.kleinanzeigen.de/s-multimedia-elektronik/preis:120:950/c161
-    base_url = search_url.split("?")[0] # Отрезаем GET параметры
-    query = search_url.split("?")[1] if "?" in search_url else ""
+    # --- НАДЕЖНОЕ ФОРМИРОВАНИЕ URL С ПОМОЩЬЮ urllib ---
+    parsed_url = urlparse(search_url)
+    domain = f"{parsed_url.scheme}://{parsed_url.netloc}" # https://www.kleinanzeigen.de
     
-    # Убираем старую пагинацию, если она была
-    base_url = re.sub(r"/seite:\d+", "", base_url)
+    # Разбираем путь: /s-multimedia-elektronik/preis:120:950/c161
+    path_parts = [p for p in parsed_url.path.split("/") if p]
     
-    parts = base_url.strip("/").split("/")
-    if len(parts) > 2:
-        domain = "https://" + parts[0]
-        category = parts[1]      # например, s-multimedia-elektronik
-        id_part = parts[-1]      # например, c161
-        filters = parts[2:-1]    # например, preis:120:950
-        filters_str = "/".join(filters)
-    else:
-        domain = "https://www.kleinanzeigen.de"
-        category = "s-suchanfrage.html"
-        id_part = ""
-        filters_str = ""
-
     all_links = []
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
@@ -343,33 +330,38 @@ async def run_parser(search_url, max_pages, db_conn):
         page = await context.new_page()
         
         for page_num in range(1, max_pages + 1):
-            # Собираем URL по точному шаблону Kleinanzeigen
             if page_num == 1:
-                url = base_url
+                url = search_url
             else:
-                if filters_str:
-                    url = f"{domain}/{category}/{filters_str}/seite:{page_num}/{id_part}"
+                # Собираем URL вида: domain/category/filters/seite:N/id
+                if len(path_parts) >= 3:
+                    category = path_parts[0]
+                    item_id = path_parts[-1]
+                    filters = path_parts[1:-1]
+                    
+                    parts_to_join = [domain, category] + filters + [f"seite:{page_num}", item_id]
+                    url = "/".join(parts_to_join)
                 else:
-                    url = f"{domain}/{category}/seite:{page_num}/{id_part}"
-            
-            if query:
-                url += f"?{query}"
+                    # Запасной вариант
+                    url = f"{domain}/{path_parts[0]}/seite:{page_num}"
+                    
+                if parsed_url.query:
+                    url += f"?{parsed_url.query}"
             
             log.info(f"Сканирую страницу {page_num}/{max_pages}: {url}")
             
-            # ДЕЛАЕМ 2 ПОПЫТКИ НА СЛУЧАЙ ОШИБКИ ИЛИ БЛОКИРОВКИ
+            # ДЕЛАЕМ 2 ПОПЫТКИ НА СЛУЧАЙ ОШИБКИ
             page_links_found = 0
             for attempt in range(2):
                 try:
                     await page.goto(url, wait_until="domcontentloaded", timeout=20000)
-                    # Прокрутка вниз для загрузки картинок и объявлений
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                     await page.wait_for_timeout(3500) 
                     
                     content = await page.content()
                     if "Cloudflare" in content or "Access Denied" in content or "captcha" in content.lower():
                         send_telegram_msg(f"🚫 Сайт заблокировал доступ (Cloudflare) на странице {page_num}.")
-                        return # Выходим совсем, если блокировка
+                        return
 
                     links = page.locator("article.aditem a, a[href*='/s-anzeige/']")
                     cnt = await links.count()
@@ -385,10 +377,10 @@ async def run_parser(search_url, max_pages, db_conn):
                                 clean = href.split("?")[0]
                                 if clean not in all_links:
                                     all_links.append(clean)
-                        break # Если нашли ссылки, прекращаем попытки для этой страницы
+                        break
                     else:
                         log.info(f"  Попытка {attempt+1}: 0 ссылок. Ждем 5 сек...")
-                        await page.wait_for_timeout(5000) # Ждем перед повтором
+                        await page.wait_for_timeout(5000)
                         
                 except Exception as e:
                     log.error(f"Ошибка на странице {page_num} (попытка {attempt+1}): {e}")
@@ -396,7 +388,7 @@ async def run_parser(search_url, max_pages, db_conn):
 
             if page_links_found == 0:
                 log.info("  Страница пуста после 2 попыток. Похоже, объявления закончились.")
-                break # Останавливаем пагинацию, если страница реально пустая
+                break
                 
         await browser.close()
 
