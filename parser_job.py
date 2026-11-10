@@ -11,6 +11,9 @@ from urllib.parse import urlparse
 from playwright.async_api import async_playwright
 from supabase import create_client, Client
 
+# ============================================================
+# НАСТРОЙКИ
+# ============================================================
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -28,6 +31,9 @@ supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# ============================================================
+# БАЗА ДАННЫХ (Временная локальная SQLite)
+# ============================================================
 def init_db():
     if os.path.exists(DB_PATH):
         os.remove(DB_PATH)
@@ -77,15 +83,16 @@ def record_listing(conn, item, existing_snapshot_links):
                 posted_date=excluded.posted_date, snapshot_at=excluded.snapshot_at
         """, (item["link"], item["price"], current_price_num, item["views"], item["favorites"], item["posted_date"], now))
         conn.commit()
-        return False
     else:
         conn.execute("""
             INSERT INTO snapshots_insert (link, price, price_numeric, views, favorites, posted_date, snapshot_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (item["link"], item["price"], current_price_num, item["views"], item["favorites"], item["posted_date"], now))
         conn.commit()
-        return True
 
+# ============================================================
+# СИНХРОНИЗАЦИЯ С SUPABASE
+# ============================================================
 def get_data_from_supabase():
     if not supabase: return {}, set()
     log.info("Запрашиваем данные из Supabase...")
@@ -144,11 +151,15 @@ def sync_to_supabase():
     finally:
         conn.close()
 
+# ============================================================
+# TELEGRAM API И ОТЧЕТЫ
+# ============================================================
 def send_telegram_msg(text):
     if not TG_TOKEN or not TG_CHAT_ID: return
     try:
         requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": "true"}, timeout=10)
-    except Exception: pass
+    except Exception as e:
+        log.error(f"Ошибка отправки в ТГ: {e}")
 
 def send_telegram_db():
     if not TG_TOKEN or not TG_CHAT_ID: return
@@ -156,6 +167,35 @@ def send_telegram_db():
         with open(DB_PATH, 'rb') as f:
             requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument", files={'document': ('listings.db', f)}, data={'chat_id': TG_CHAT_ID}, timeout=30)
     except Exception: pass
+
+def send_top_50(run_results):
+    """Формирует и отправляет ТОП-50 объявлений по просмотрам ЗА ТЕКУЩИЙ ПАРСИНГ"""
+    if not TG_TOKEN: return
+    if not run_results:
+        send_telegram_msg("📊 <b>ТОП-50 (за текущий парсинг)</b>\n\nНовых или обновленных объявлений не найдено.")
+        return
+
+    log.info(f"Формируем ТОП-50 из {len(run_results)} спаршенных объявлений...")
+    
+    # Сортируем результаты текущего запуска по просмотрам (по убыванию)
+    sorted_results = sorted(run_results, key=lambda x: x.get("views", 0), reverse=True)[:50]
+
+    msg = "🏆 <b>ТОП-50 объявлений по просмотрам (за этот запуск)</b>\n\n"
+    
+    for i, row in enumerate(sorted_results, 1):
+        title = row.get('title', 'Без названия')
+        title = title[:40].replace('<', '&lt;').replace('>', '&gt;') + "..." if len(title) > 40 else title
+        
+        msg += f"{i}. <a href='{row['link']}'>{title}</a>\n"
+        msg += f"👁 {row.get('views', 0)} | 💰 {row.get('price', 'Не указана')}\n\n"
+
+        # Защита от лимита в 4096 символов
+        if len(msg) > 3500:
+            send_telegram_msg(msg)
+            msg = "🏆 <b>ТОП-50 (продолжение)</b>\n\n"
+
+    if msg.strip() != "🏆 <b>ТОП-50 (продолжение)</b>":
+        send_telegram_msg(msg)
 
 async def wait_for_user_url():
     log.info(f"Ожидание ссылки из ТГ (макс. {WAIT_TIMEOUT_MINUTES} мин)...")
@@ -197,6 +237,9 @@ async def wait_for_user_url():
     send_telegram_msg(f"⏰ Время вышло! Запускаю по умолчанию.")
     return DEFAULT_SEARCH_URL, DEFAULT_PAGES
 
+# ============================================================
+# ПАРСЕР (Playwright)
+# ============================================================
 async def get_listing_details(page, url, retries=2):
     for attempt in range(retries):
         try:
@@ -204,7 +247,8 @@ async def get_listing_details(page, url, retries=2):
             await page.goto(url, wait_until="domcontentloaded", timeout=20000)
             await page.wait_for_timeout(800)
             page_text = await page.inner_text("body")
-            if "Gewerblicher Anbieter" in page_text: return None
+            # Отсекаем магазины (и старое, и новое обозначение)
+            if "Gewerblicher Anbieter" in page_text or "Gewerblicher Nutzer" in page_text: return None
 
             views = 0
             try:
@@ -252,11 +296,14 @@ async def process_batch(links, db_conn, existing_snapshot_links):
         except asyncio.TimeoutError: results = []
 
         await browser.close()
+        
+        batch_parsed_results = []
         for res in results:
             if isinstance(res, dict):
-                is_new = record_listing(db_conn, res, existing_snapshot_links)
-                if is_new:
-                    send_telegram_msg(f"🔥 <b>Новое объявление!</b>\n\n📦 {res['title']}\n💰 Цена: {res['price']}\n<a href='{res['link']}'>Открыть</a>")
+                record_listing(db_conn, res, existing_snapshot_links)
+                batch_parsed_results.append(res) # Сохраняем для отчета
+                
+        return batch_parsed_results
 
 async def run_parser(search_url, max_pages, db_conn, recently_checked, existing_snapshot_links):
     log.info(f"Старт парсинга: {search_url} (стр: {max_pages})")
@@ -290,7 +337,7 @@ async def run_parser(search_url, max_pages, db_conn, recently_checked, existing_
                     
                     if "Cloudflare" in await page.content() or "captcha" in (await page.content()).lower():
                         log.warning("🚫 Блокировка Cloudflare.")
-                        return
+                        return []
 
                     links = page.locator("article.aditem a, a[href*='/s-anzeige/']")
                     cnt = await links.count()
@@ -328,26 +375,36 @@ async def run_parser(search_url, max_pages, db_conn, recently_checked, existing_
         log.info(f"🎯 Осталось для парсинга: {len(filtered_links)}")
         all_links = filtered_links
 
+    run_results = [] # Сюда собираем результаты текущего запуска
     if all_links:
         batch_size = 8
         for i in range(0, len(all_links), batch_size):
             batch = all_links[i:i + batch_size]
             log.info(f"Батч {i//batch_size + 1} из {(len(all_links)-1)//batch_size + 1}")
-            await process_batch(batch, db_conn, existing_snapshot_links)
+            
+            batch_res = await process_batch(batch, db_conn, existing_snapshot_links)
+            run_results.extend(batch_res) # Добавляем в общий список
+            
             await asyncio.sleep(random.uniform(2.0, 4.0))
     else:
         log.info("Нет новых или требующих обновления объявлений.")
+        
+    return run_results
 
 async def main():
     db_conn = init_db()
     recently_checked, existing_snapshot_links = get_data_from_supabase()
     search_url, max_pages = await wait_for_user_url()
     
-    await run_parser(search_url, max_pages, db_conn, recently_checked, existing_snapshot_links)
+    run_results = await run_parser(search_url, max_pages, db_conn, recently_checked, existing_snapshot_links)
     db_conn.close()
     
     send_telegram_db()
     sync_to_supabase()
+    
+    # Отправляем красивый отчет в конце, передавая ему результаты
+    send_top_50(run_results)
+    
     send_telegram_msg("✅ Парсинг завершен. Все данные загружены в Supabase.")
 
 if __name__ == "__main__":
