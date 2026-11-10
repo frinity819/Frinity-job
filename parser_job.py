@@ -11,16 +11,12 @@ from urllib.parse import urlparse
 from playwright.async_api import async_playwright
 from supabase import create_client, Client
 
-# ============================================================
-# НАСТРОЙКИ
-# ============================================================
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 DB_PATH = "listings.db"
 
-# --- НАСТРОЙКИ ПО УМОЛЧАНИЮ ---
 DEFAULT_SEARCH_URL = "https://www.kleinanzeigen.de/s-multimedia-elektronik/preis:120:950/c161"
 DEFAULT_PAGES = 50
 WAIT_TIMEOUT_MINUTES = 20 
@@ -32,21 +28,21 @@ supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ============================================================
-# БАЗА ДАННЫХ (Временная локальная SQLite)
-# ============================================================
 def init_db():
     if os.path.exists(DB_PATH):
-        os.remove(DB_PATH) # Удаляем старую, чтобы начать с чистой
-        
+        os.remove(DB_PATH)
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("CREATE TABLE IF NOT EXISTS listings (link TEXT PRIMARY KEY, title TEXT, first_seen TEXT, last_checked TEXT)")
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, link TEXT, price TEXT, 
-            price_numeric REAL, views INTEGER, favorites INTEGER, 
-            posted_date TEXT, snapshot_at TEXT,
-            FOREIGN KEY(link) REFERENCES listings(link)
+        CREATE TABLE IF NOT EXISTS snapshots_insert (
+            link TEXT PRIMARY KEY, price TEXT, price_numeric REAL, 
+            views INTEGER, favorites INTEGER, posted_date TEXT, snapshot_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS snapshots_update (
+            link TEXT PRIMARY KEY, price TEXT, price_numeric REAL, 
+            views INTEGER, favorites INTEGER, posted_date TEXT, snapshot_at TEXT
         )
     """)
     conn.commit()
@@ -61,52 +57,53 @@ def parse_price_numeric(price_str):
     try: return float(f"{int_part}.{frac}")
     except ValueError: return None
 
-def record_listing(conn, item):
+def record_listing(conn, item, existing_snapshot_links):
     now = datetime.datetime.now().isoformat(timespec="seconds")
+    current_price_num = parse_price_numeric(item["price"])
     
-    # Сохраняем во временную локальную базу
     conn.execute("""
         INSERT INTO listings (link, title, first_seen, last_checked) 
         VALUES (?, ?, ?, ?) 
-        ON CONFLICT(link) DO UPDATE SET last_checked=excluded.last_checked
+        ON CONFLICT(link) DO UPDATE SET title=excluded.title, last_checked=excluded.last_checked
     """, (item["link"], item["title"], now, now))
     
-    last_row = conn.execute("SELECT price FROM snapshots WHERE link=? ORDER BY id DESC LIMIT 1", 
-                            (item["link"],)).fetchone()
-    last_price = last_row[0] if last_row else None
-    
-    if last_price != item["price"]:
+    if item["link"] in existing_snapshot_links:
         conn.execute("""
-            INSERT INTO snapshots (link, price, price_numeric, views, favorites, posted_date, snapshot_at)
+            INSERT INTO snapshots_update (link, price, price_numeric, views, favorites, posted_date, snapshot_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (item["link"], item["price"], parse_price_numeric(item["price"]),
-              item["views"], item["favorites"], item["posted_date"], now))
+            ON CONFLICT(link) DO UPDATE SET 
+                price=excluded.price, price_numeric=excluded.price_numeric,
+                views=excluded.views, favorites=excluded.favorites, 
+                posted_date=excluded.posted_date, snapshot_at=excluded.snapshot_at
+        """, (item["link"], item["price"], current_price_num, item["views"], item["favorites"], item["posted_date"], now))
+        conn.commit()
+        return False
+    else:
+        conn.execute("""
+            INSERT INTO snapshots_insert (link, price, price_numeric, views, favorites, posted_date, snapshot_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (item["link"], item["price"], current_price_num, item["views"], item["favorites"], item["posted_date"], now))
         conn.commit()
         return True
-    conn.commit()
-    return False
 
-# ============================================================
-# СИНХРОНИЗАЦИЯ С SUPABASE
-# ============================================================
-def get_recently_checked_from_supabase():
-    """Скачивает из облака список ссылок и время их проверки"""
-    if not supabase: return {}
-    log.info("Запрашиваем время последних проверок из Supabase...")
+def get_data_from_supabase():
+    if not supabase: return {}, set()
+    log.info("Запрашиваем данные из Supabase...")
     try:
-        # Берем все ссылки и их last_checked (Supabase отдает максимум 1000 за раз)
-        # Для простоты берем последние 5000 записей
         res = supabase.table('listings').select('link, last_checked').order('last_checked', desc=True).limit(5000).execute()
         checked_dict = {row['link']: row['last_checked'] for row in res.data if row.get('last_checked')}
-        log.info(f"Получено {len(checked_dict)} отметок о проверках из Supabase.")
-        return checked_dict
+        
+        res_snap = supabase.table('snapshots').select('link').limit(20000).execute()
+        existing_snapshot_links = {row['link'] for row in res_snap.data}
+                
+        log.info(f"Получено {len(checked_dict)} отметок и {len(existing_snapshot_links)} уникальных ссылок в snapshots.")
+        return checked_dict, existing_snapshot_links
     except Exception as e:
-        log.error(f"Ошибка получения данных из Supabase: {e}")
-        return {}
+        log.error(f"Ошибка получения данных: {e}")
+        return {}, set()
 
 def sync_to_supabase():
-    if not supabase:
-        return
+    if not supabase: return
     log.info("Начинаем синхронизацию с Supabase...")
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -117,51 +114,58 @@ def sync_to_supabase():
         if listings:
             for i in range(0, len(listings), 500):
                 supabase.table('listings').upsert(listings[i:i+500], on_conflict='link').execute()
-            log.info(f"✅ Обновлено {len(listings)} объявлений в облаке.")
+            log.info(f"✅ Обновлено {len(listings)} объявлений в listings.")
 
-        # В локальной базе лежат ТОЛЬКО снимки за текущий запуск. 
-        # Поэтому мы просто отправляем их все.
-        cursor.execute("SELECT link, price, price_numeric, views, favorites, posted_date, snapshot_at FROM snapshots")
-        snapshots = [dict(row) for row in cursor.fetchall()]
-        
-        if snapshots:
-            for i in range(0, len(snapshots), 500):
-                supabase.table('snapshots').insert(snapshots[i:i+500]).execute()
-            log.info(f"✅ Добавлено {len(snapshots)} новых снимков цен.")
+        cursor.execute("SELECT link, price, price_numeric, views, favorites, posted_date, snapshot_at FROM snapshots_insert")
+        inserts = [dict(row) for row in cursor.fetchall()]
+        if inserts:
+            for i in range(0, len(inserts), 500):
+                supabase.table('snapshots').insert(inserts[i:i+500]).execute()
+            log.info(f"✅ Добавлено {len(inserts)} новых строк в snapshots.")
+            
+        cursor.execute("SELECT link, price, price_numeric, views, favorites, posted_date, snapshot_at FROM snapshots_update")
+        updates = [dict(row) for row in cursor.fetchall()]
+        updated_count = 0
+        if updates:
+            for up in updates:
+                supabase.table('snapshots').update({
+                    'price': up['price'],
+                    'price_numeric': up['price_numeric'],
+                    'views': up['views'],
+                    'favorites': up['favorites'],
+                    'posted_date': up['posted_date'],
+                    'snapshot_at': up['snapshot_at']
+                }).eq('link', up['link']).execute()
+                updated_count += 1
+            log.info(f"✅ Обновлено {updated_count} объявлений в snapshots по ссылке.")
+            
     except Exception as e:
         log.error(f"❌ Ошибка Supabase: {e}")
     finally:
         conn.close()
 
-# ============================================================
-# TELEGRAM API
-# ============================================================
 def send_telegram_msg(text):
     if not TG_TOKEN or not TG_CHAT_ID: return
     try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", 
-                      data={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": "true"}, timeout=10)
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": "true"}, timeout=10)
     except Exception: pass
 
 def send_telegram_db():
     if not TG_TOKEN or not TG_CHAT_ID: return
     try:
         with open(DB_PATH, 'rb') as f:
-            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument", 
-                          files={'document': ('listings.db', f)}, data={'chat_id': TG_CHAT_ID}, timeout=30)
+            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument", files={'document': ('listings.db', f)}, data={'chat_id': TG_CHAT_ID}, timeout=30)
     except Exception: pass
 
 async def wait_for_user_url():
-    log.info(f"Ожидание ответа от пользователя в Telegram (макс. {WAIT_TIMEOUT_MINUTES} мин)...")
+    log.info(f"Ожидание ссылки из ТГ (макс. {WAIT_TIMEOUT_MINUTES} мин)...")
     try:
         r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?offset=-1", timeout=10)
         updates = r.json().get("result", [])
         offset = updates[-1]["update_id"] + 1 if updates else 0
-    except Exception:
-        offset = 0
+    except Exception: offset = 0
 
-    send_telegram_msg(f"🤖 <b>Бот запущен!</b>\n\nОтправьте мне ссылку.\n⏳ У вас есть {WAIT_TIMEOUT_MINUTES} минут.")
-
+    send_telegram_msg(f"🤖 <b>Бот запущен!</b>\n\nОтправьте ссылку.\n⏳ {WAIT_TIMEOUT_MINUTES} мин.")
     start_time = time.time()
     last_notification = 0
 
@@ -170,40 +174,29 @@ async def wait_for_user_url():
             url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?offset={offset}&timeout=10"
             r = requests.get(url, timeout=15)
             updates = r.json().get("result", [])
-            
             for update in updates:
                 offset = update["update_id"] + 1
                 message = update.get("message", {})
-                
                 if str(message.get("chat", {}).get("id")) == str(TG_CHAT_ID):
                     text = message.get("text", "").strip()
                     if text:
                         parts = text.split()
                         if len(parts) >= 1 and parts[0].startswith("http"):
                             search_url = parts[0]
-                            pages = 3
-                            if len(parts) > 1 and parts[1].isdigit():
-                                pages = int(parts[1])
-                            
-                            send_telegram_msg(f"⏳ Принято! Начинаю парсить:\n{search_url}\nСтраниц: {pages}")
+                            pages = 3 if len(parts) == 1 else int(parts[1])
+                            send_telegram_msg(f"⏳ Принято!\n{search_url}\nСтраниц: {pages}")
                             return search_url, pages
-        except Exception:
-            pass 
+        except Exception: pass 
         
-        elapsed_minutes = (time.time() - start_time) / 60
-        if elapsed_minutes > (WAIT_TIMEOUT_MINUTES - 5) and last_notification == 0:
-            send_telegram_msg("⏰ Осталось 5 минут. Если не пришлете ссылку, начну парсинг по умолчанию.")
+        if (time.time() - start_time) / 60 > (WAIT_TIMEOUT_MINUTES - 5) and last_notification == 0:
+            send_telegram_msg("⏰ Осталось 5 минут.")
             last_notification = 1
-
         await asyncio.sleep(2)
 
-    log.info("Время ожидания вышло. Запускаем парсинг по умолчанию.")
-    send_telegram_msg(f"⏰ Время вышло! Запускаю парсинг по умолчанию.")
+    log.info("Время вышло. Запускаем по умолчанию.")
+    send_telegram_msg(f"⏰ Время вышло! Запускаю по умолчанию.")
     return DEFAULT_SEARCH_URL, DEFAULT_PAGES
 
-# ============================================================
-# ПАРСЕР (Playwright)
-# ============================================================
 async def get_listing_details(page, url, retries=2):
     for attempt in range(retries):
         try:
@@ -248,26 +241,25 @@ async def get_listing_details(page, url, retries=2):
             if attempt == retries - 1: return None
             await asyncio.sleep(2)
 
-async def process_batch(links, db_conn):
+async def process_batch(links, db_conn, existing_snapshot_links):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
         context = await browser.new_context(viewport={"width": 1366, "height": 768}, locale="de-DE")
         tasks = [await context.new_page() for _ in links]
 
         try:
-            results = await asyncio.wait_for(
-                asyncio.gather(*[get_listing_details(tasks[i], links[i]) for i in range(len(links))], return_exceptions=True), timeout=30.0)
+            results = await asyncio.wait_for(asyncio.gather(*[get_listing_details(tasks[i], links[i]) for i in range(len(links))], return_exceptions=True), timeout=30.0)
         except asyncio.TimeoutError: results = []
 
         await browser.close()
         for res in results:
             if isinstance(res, dict):
-                if record_listing(db_conn, res):
-                    send_telegram_msg(f"🔥 <b>Новое или изменена цена!</b>\n\n📦 {res['title']}\n💰 Цена: {res['price']}\n<a href='{res['link']}'>Открыть</a>")
+                is_new = record_listing(db_conn, res, existing_snapshot_links)
+                if is_new:
+                    send_telegram_msg(f"🔥 <b>Новое объявление!</b>\n\n📦 {res['title']}\n💰 Цена: {res['price']}\n<a href='{res['link']}'>Открыть</a>")
 
-async def run_parser(search_url, max_pages, db_conn, recently_checked):
+async def run_parser(search_url, max_pages, db_conn, recently_checked, existing_snapshot_links):
     log.info(f"Старт парсинга: {search_url} (стр: {max_pages})")
-    
     parsed_url = urlparse(search_url)
     domain = f"{parsed_url.scheme}://{parsed_url.netloc}" 
     path_parts = [p for p in parsed_url.path.split("/") if p]
@@ -275,25 +267,20 @@ async def run_parser(search_url, max_pages, db_conn, recently_checked):
     all_links = []
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={"width": 1366, "height": 768}, locale="de-DE")
+        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", viewport={"width": 1366, "height": 768}, locale="de-DE")
         page = await context.new_page()
         
         for page_num in range(1, max_pages + 1):
-            if page_num == 1:
-                url = search_url
+            if page_num == 1: url = search_url
             else:
                 if len(path_parts) >= 3:
                     category, item_id = path_parts[0], path_parts[-1]
                     filters = path_parts[1:-1]
                     url = "/".join([domain, category] + filters + [f"seite:{page_num}", item_id])
-                else:
-                    url = f"{domain}/{path_parts[0]}/seite:{page_num}"
+                else: url = f"{domain}/{path_parts[0]}/seite:{page_num}"
                 if parsed_url.query: url += f"?{parsed_url.query}"
             
             log.info(f"Сканирую страницу {page_num}/{max_pages}...")
-            
             page_links_found = 0
             for attempt in range(2):
                 try:
@@ -332,56 +319,35 @@ async def run_parser(search_url, max_pages, db_conn, recently_checked):
 
     log.info(f"Всего собрано уникальных ссылок: {len(all_links)}")
     
-    # ============================================================
-    # ФИЛЬТРАЦИЯ НА ОСНОВЕ ДАННЫХ ИЗ SUPABASE
-    # ============================================================
     if all_links:
         now = datetime.datetime.now()
         time_threshold = (now - datetime.timedelta(hours=5)).isoformat(timespec="seconds")
+        filtered_links = [link for link in all_links if link not in recently_checked or recently_checked[link] < time_threshold]
         
-        filtered_links = []
-        for link in all_links:
-            if link not in recently_checked:
-                # Если ссылки вообще нет в базе — берем
-                filtered_links.append(link)
-            else:
-                # Если ссылка есть, проверяем её last_checked
-                last_check_str = recently_checked[link]
-                if last_check_str < time_threshold:
-                    # Если проверяли более 5 часов назад — берем
-                    filtered_links.append(link)
-        
-        log.info(f"🔍 Фильтрация: пропущено {len(all_links) - len(filtered_links)} недавно проверенных ссылок.")
-        log.info(f"🎯 Осталось ссылок для парсинга: {len(filtered_links)}")
-        
+        log.info(f"🔍 Пропущено недавно проверенных: {len(all_links) - len(filtered_links)}.")
+        log.info(f"🎯 Осталось для парсинга: {len(filtered_links)}")
         all_links = filtered_links
-    # ============================================================
 
     if all_links:
         batch_size = 8
         for i in range(0, len(all_links), batch_size):
             batch = all_links[i:i + batch_size]
             log.info(f"Батч {i//batch_size + 1} из {(len(all_links)-1)//batch_size + 1}")
-            await process_batch(batch, db_conn)
+            await process_batch(batch, db_conn, existing_snapshot_links)
             await asyncio.sleep(random.uniform(2.0, 4.0))
     else:
         log.info("Нет новых или требующих обновления объявлений.")
 
 async def main():
     db_conn = init_db()
-    
-    # Скачиваем историю проверок из облака
-    recently_checked = get_recently_checked_from_supabase()
-    
+    recently_checked, existing_snapshot_links = get_data_from_supabase()
     search_url, max_pages = await wait_for_user_url()
     
-    await run_parser(search_url, max_pages, db_conn, recently_checked)
+    await run_parser(search_url, max_pages, db_conn, recently_checked, existing_snapshot_links)
     db_conn.close()
     
-    # Отправляем в ТГ временную базу и синхронизируем с облаком
     send_telegram_db()
     sync_to_supabase()
-    
     send_telegram_msg("✅ Парсинг завершен. Все данные загружены в Supabase.")
 
 if __name__ == "__main__":
