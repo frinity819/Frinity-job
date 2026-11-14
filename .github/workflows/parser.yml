@@ -18,11 +18,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip' # Включает встроенный кэш для pip
+          cache: 'pip'
 
-      # Кэшируем браузеры Playwright
-      # ВАЖНО: Изменен ключ на -v2-, чтобы принудительно сбросить старый кэш, 
-      # в котором нет chromium-headless-shell
+      # ВАЖНО: Изменен ключ кэша на -v2-, чтобы сбросить старый кэш
       - name: Cache Playwright Browsers
         uses: actions/cache@v4
         id: playwright-cache
@@ -37,12 +35,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           
-      # ГЛАВНОЕ ИСПРАВЛЕНИЕ: Добавлен chromium-headless-shell в команду установки
+      # ГЛАВНОЕ ИСПРАВЛЕНИЕ: Добавлен chromium-headless-shell
       - name: Install Playwright Browsers
         if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: playwright install --with-deps chromium chromium-headless-shell
 
-      # Если браузер взялся из кэша, все равно нужно доустановить системные зависимости
       - name: Install Playwright Deps (if cached)
         if: steps.playwright-cache.outputs.cache-hit == 'true'
         run: playwright install-deps chromium
