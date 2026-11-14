@@ -20,29 +20,25 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      # ВАЖНО: Изменен ключ кэша на -v2-, чтобы сбросить старый кэш
+      # Кэшируем браузеры (обновил ключ до v3, чтобы сбросить старый проблемный кэш)
       - name: Cache Playwright Browsers
         uses: actions/cache@v4
         id: playwright-cache
         with:
           path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-v2-${{ hashFiles('requirements.txt') }}
+          key: ${{ runner.os }}-playwright-v3-${{ hashFiles('requirements.txt') }}
           restore-keys: |
-            ${{ runner.os }}-playwright-v2-
+            ${{ runner.os }}-playwright-v3-
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           
-      # ГЛАВНОЕ ИСПРАВЛЕНИЕ: Добавлен chromium-headless-shell
+      # ВАЖНО: Убрано условие if. Теперь команда выполняется ВСЕГДА.
+      # Это гарантирует, что chromium-headless-shell будет установлен.
       - name: Install Playwright Browsers
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: playwright install --with-deps chromium chromium-headless-shell
-
-      - name: Install Playwright Deps (if cached)
-        if: steps.playwright-cache.outputs.cache-hit == 'true'
-        run: playwright install-deps chromium
 
       - name: Run parser
         env:
